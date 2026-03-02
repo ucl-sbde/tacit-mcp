@@ -2,7 +2,7 @@
  * Shared API client for Tacit REST and GraphQL endpoints.
  */
 
-const API_URL = process.env.TACIT_API_URL || "https://api.tacit.dev";
+const API_URL = process.env.TACIT_API_URL || "https://app.betacit.com";
 const API_KEY = process.env.TACIT_API_KEY || "";
 
 interface GraphQLResponse<T = unknown> {

@@ -97,7 +97,7 @@ Once connected, ask your AI assistant things like:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TACIT_API_KEY` | Yes | | Your Tacit API key |
-| `TACIT_API_URL` | No | `https://api.tacit.dev` | API base URL (for self-hosted deployments) |
+| `TACIT_API_URL` | No | `https://app.betacit.com` | API base URL (for self-hosted deployments) |
 
 ## Development
 
