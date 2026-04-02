@@ -3,41 +3,35 @@
 /**
  * Streamable HTTP transport for the Tacit MCP server.
  *
- * Enables remote MCP connections over HTTP, supporting:
- * - Streamable HTTP (MCP spec's latest transport standard)
- * - Bearer token authentication (API keys or OAuth tokens)
- * - Optional OAuth 2.1 authorization server (set TACIT_OAUTH_ISSUER)
- * - Session management with automatic cleanup
- * - CORS for browser-based MCP clients
- *
  * Usage:
  *   TACIT_API_KEY=... node dist/http.js                    # API key mode
  *   TACIT_OAUTH_ISSUER=https://... node dist/http.js       # OAuth mode
  */
 
 import { randomUUID } from "node:crypto";
+import type { Request } from "express";
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { createServer } from "./server.js";
 import { TacitTokenVerifier, TacitOAuthProvider } from "./auth.js";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 const PORT = parseInt(process.env.PORT || "3001", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const MCP_PATH = process.env.MCP_PATH || "/mcp";
 const OAUTH_ISSUER = process.env.TACIT_OAUTH_ISSUER;
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60_000;
+const SESSION_REAP_INTERVAL_MS = 5 * 60_000;
 
-// ---------------------------------------------------------------------------
-// Session management
-// ---------------------------------------------------------------------------
+interface Session {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+  lastActivity: number;
+}
 
-const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+const sessions = new Map<string, Session>();
 
 function createSession(): { transport: StreamableHTTPServerTransport; server: McpServer } {
   const server = createServer();
@@ -55,13 +49,29 @@ function createSession(): { transport: StreamableHTTPServerTransport; server: Mc
   return { transport, server };
 }
 
-// ---------------------------------------------------------------------------
-// Express app
-// ---------------------------------------------------------------------------
+function getSession(req: Request): Session | undefined {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  return sessionId ? sessions.get(sessionId) : undefined;
+}
+
+function touchSession(session: Session): void {
+  session.lastActivity = Date.now();
+}
+
+// Reap idle sessions periodically
+const reaper = setInterval(() => {
+  const cutoff = Date.now() - SESSION_IDLE_TIMEOUT_MS;
+  for (const [sid, session] of sessions) {
+    if (session.lastActivity < cutoff) {
+      session.transport.close();
+      sessions.delete(sid);
+    }
+  }
+}, SESSION_REAP_INTERVAL_MS);
+reaper.unref();
 
 const app = express();
 
-// CORS for browser-based clients
 app.use((_req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -73,10 +83,6 @@ app.use((_req, res, next) => {
   }
   next();
 });
-
-// ---------------------------------------------------------------------------
-// Auth setup — OAuth 2.1 or simple bearer token
-// ---------------------------------------------------------------------------
 
 if (OAUTH_ISSUER) {
   const provider = new TacitOAuthProvider();
@@ -90,78 +96,55 @@ if (OAUTH_ISSUER) {
     }),
   );
 
-  app.use(
-    MCP_PATH,
-    requireBearerAuth({ verifier: provider }),
-  );
+  app.use(MCP_PATH, requireBearerAuth({ verifier: provider }));
 
   console.error(`OAuth 2.1 enabled (issuer: ${OAUTH_ISSUER})`);
 } else {
-  // Simple bearer token auth — validates API key against Tacit
   const verifier = new TacitTokenVerifier();
-
   app.use(MCP_PATH, requireBearerAuth({ verifier }));
-
   console.error("Bearer token auth enabled (API key mode)");
 }
-
-// ---------------------------------------------------------------------------
-// Health check
-// ---------------------------------------------------------------------------
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", transport: "streamable-http", sessions: sessions.size });
 });
 
-// ---------------------------------------------------------------------------
-// MCP endpoint — Streamable HTTP
-// ---------------------------------------------------------------------------
-
 app.post(MCP_PATH, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  let session = getSession(req);
 
-  let entry = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (!entry) {
-    // New session (initialization request)
-    entry = createSession();
-    const sid = entry.transport.sessionId;
-    if (sid) sessions.set(sid, entry);
+  if (!session) {
+    const { transport, server } = createSession();
+    session = { transport, server, lastActivity: Date.now() };
+    await transport.handleRequest(req, res);
+    const sid = transport.sessionId;
+    if (sid) sessions.set(sid, session);
+    return;
   }
 
-  await entry.transport.handleRequest(req, res);
+  touchSession(session);
+  await session.transport.handleRequest(req, res);
 });
 
-// GET for SSE stream (long-lived server-to-client channel)
 app.get(MCP_PATH, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const entry = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (!entry) {
+  const session = getSession(req);
+  if (!session) {
     res.status(400).json({ error: "Missing or invalid session ID" });
     return;
   }
 
-  await entry.transport.handleRequest(req, res);
+  touchSession(session);
+  await session.transport.handleRequest(req, res);
 });
 
-// DELETE to terminate session
 app.delete(MCP_PATH, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const entry = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (!entry) {
+  const session = getSession(req);
+  if (!session) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
 
-  await entry.transport.handleRequest(req, res);
-  sessions.delete(sessionId!);
+  await session.transport.handleRequest(req, res);
 });
-
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 
 app.listen(PORT, HOST, () => {
   console.error(`Tacit MCP server (HTTP) listening on http://${HOST}:${PORT}${MCP_PATH}`);

@@ -107,7 +107,7 @@ Run the server as a persistent HTTP service. Best for teams, cloud deployments, 
 TACIT_API_KEY=your-api-key npm run start:http
 
 # Or with npx
-TACIT_API_KEY=your-api-key npx -y @tacit/mcp-server/../tacit-mcp-http
+TACIT_API_KEY=your-api-key npx --package @tacit/mcp-server tacit-mcp-http
 ```
 
 The server listens on `http://0.0.0.0:3001/mcp` by default.
